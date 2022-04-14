@@ -31,6 +31,7 @@ defmodule Finch.HTTP2.Pool do
   def request(pool, request, acc, fun, opts) do
     opts = Keyword.put_new(opts, :receive_timeout, @default_receive_timeout)
     timeout = opts[:receive_timeout]
+    max_body = Keyword.get(opts, :max_response_body, :infinity)
 
     metadata = %{request: request}
 
@@ -48,13 +49,21 @@ defmodule Finch.HTTP2.Pool do
       start_time = Telemetry.start(:recv, metadata)
 
       try do
-        result = response_waiting_loop(acc, fun, ref, monitor, fail_safe_timeout)
+        result = response_waiting_loop(acc, fun, ref, monitor, fail_safe_timeout, max_body)
 
         case result do
           {:ok, {status, headers, _}} ->
             metadata = Map.merge(metadata, %{status: status, headers: headers})
             Telemetry.stop(:recv, start_time, metadata)
             result
+
+          {:error, error = :response_body_too_large} ->
+            metadata = Map.put(metadata, :error, error)
+            Telemetry.stop(:recv, start_time, metadata)
+            :gen_statem.call(pool, {:cancel, ref})
+            clean_responses(ref)
+            Process.demonitor(monitor)
+            {:error, Error.exception(error)}
 
           {:error, error} ->
             metadata = Map.put(metadata, :error, error)
@@ -67,20 +76,76 @@ defmodule Finch.HTTP2.Pool do
 
           :gen_statem.call(pool, {:cancel, ref})
           clean_responses(ref)
-          Process.demonitor(monitor)
+          Process.demonitor(monitor, [:flush])
 
           :erlang.raise(kind, error, __STACKTRACE__)
       end
     end
   end
 
-  defp response_waiting_loop(acc, fun, ref, monitor_ref, fail_safe_timeout) do
+  defp response_waiting_loop(
+         acc,
+         fun,
+         ref,
+         monitor_ref,
+         fail_safe_timeout,
+         max_body,
+         body_sum \\ 0
+       )
+
+  defp response_waiting_loop(acc, fun, ref, monitor_ref, fail_safe_timeout, max_body, body_sum) do
     receive do
       {:DOWN, ^monitor_ref, _, _, _} ->
         {:error, :connection_process_went_down}
 
-      {kind, ^ref, value} when kind in [:status, :headers, :data] ->
-        response_waiting_loop(fun.({kind, value}, acc), fun, ref, monitor_ref, fail_safe_timeout)
+      {:status, ^ref, value} ->
+        response_waiting_loop(
+          fun.({:status, value}, acc),
+          fun,
+          ref,
+          monitor_ref,
+          fail_safe_timeout,
+          max_body,
+          body_sum
+        )
+
+      {:headers, ^ref, value} ->
+        with true <- is_integer(max_body),
+             {_header_name, content_length_str} <- List.keyfind(value, "content-length", 0),
+             {content_length, ""} <- Integer.parse(content_length_str),
+             true <- content_length > max_body do
+          {:error, :response_body_too_large}
+        else
+          _ ->
+            response_waiting_loop(
+              fun.({:headers, value}, acc),
+              fun,
+              ref,
+              monitor_ref,
+              fail_safe_timeout,
+              max_body,
+              body_sum
+            )
+        end
+
+      {:data, ^ref, value} ->
+        body_sum = :erlang.iolist_size(value) + body_sum
+
+        with true <- is_integer(max_body),
+             true <- body_sum > max_body do
+          {:error, :response_body_too_large}
+        else
+          _ ->
+            response_waiting_loop(
+              fun.({:data, value}, acc),
+              fun,
+              ref,
+              monitor_ref,
+              fail_safe_timeout,
+              max_body,
+              body_sum
+            )
+        end
 
       {:done, ^ref} ->
         Process.demonitor(monitor_ref)

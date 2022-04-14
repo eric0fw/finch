@@ -294,6 +294,9 @@ defmodule Finch do
     * `:receive_timeout` - The maximum time to wait for a response before returning an error.
       Default value is `15_000`.
 
+    * `:max_response_size` - The maximum size of the response body. Exception raise has reason: `:response_body_too_large`.
+      Default value is `:infinity`.
+
   """
   @spec request(Request.t(), name(), keyword()) ::
           {:ok, Response.t()}

@@ -4,6 +4,7 @@ defmodule Finch.Conn do
   alias Mint.HTTP1
   alias Finch.Telemetry
   alias Finch.SSL
+  alias Finch.Error
 
   def new(scheme, host, port, opts, parent) do
     %{
@@ -93,9 +94,9 @@ defmodule Finch.Conn do
     end
   end
 
-  def request(%{mint: nil} = conn, _, _, _, _, _), do: {:error, conn, "Could not connect"}
+  def request(%{mint: nil} = conn, _, _, _, _, _, _), do: {:error, conn, "Could not connect"}
 
-  def request(conn, req, acc, fun, receive_timeout, idle_time) do
+  def request(conn, req, acc, fun, receive_timeout, idle_time, max_body) do
     full_path = Finch.Request.request_path(req)
 
     metadata = %{request: req}
@@ -111,7 +112,7 @@ defmodule Finch.Conn do
             {:ok, mint} ->
               Telemetry.stop(:send, start_time, metadata, extra_measurements)
               start_time = Telemetry.start(:recv, metadata, extra_measurements)
-              response = receive_response([], acc, fun, mint, ref, receive_timeout)
+              response = receive_response([], acc, fun, mint, ref, receive_timeout, max_body)
               handle_response(response, conn, metadata, start_time, extra_measurements)
 
             {:error, mint, error} ->
@@ -174,6 +175,11 @@ defmodule Finch.Conn do
         Telemetry.stop(:recv, start_time, metadata, extra_measurements)
         {:ok, %{conn | mint: mint}, acc}
 
+      {:error, _mint, error = :response_body_too_large} ->
+        metadata = Map.put(metadata, :error, error)
+        Telemetry.stop(:recv, start_time, metadata, extra_measurements)
+        {:error, close(conn), Error.exception(error)}
+
       {:error, mint, error} ->
         metadata = Map.put(metadata, :error, error)
         Telemetry.stop(:recv, start_time, metadata, extra_measurements)
@@ -181,26 +187,71 @@ defmodule Finch.Conn do
     end
   end
 
-  defp receive_response([], acc, fun, mint, ref, timeout) do
+  defp receive_response(entries, acc, fun, mint, ref, timeout, max_body, body_sum \\ 0)
+
+  defp receive_response([], acc, fun, mint, ref, timeout, max_body, body_sum) do
     case HTTP1.recv(mint, 0, timeout) do
       {:ok, mint, entries} ->
-        receive_response(entries, acc, fun, mint, ref, timeout)
+        receive_response(entries, acc, fun, mint, ref, timeout, max_body, body_sum)
 
       {:error, mint, error, _responses} ->
         {:error, mint, error}
     end
   end
 
-  defp receive_response([entry | entries], acc, fun, mint, ref, timeout) do
+  defp receive_response([entry | entries], acc, fun, mint, ref, timeout, max_body, body_sum) do
     case entry do
       {:status, ^ref, value} ->
-        receive_response(entries, fun.({:status, value}, acc), fun, mint, ref, timeout)
+        receive_response(
+          entries,
+          fun.({:status, value}, acc),
+          fun,
+          mint,
+          ref,
+          timeout,
+          max_body,
+          body_sum
+        )
 
       {:headers, ^ref, value} ->
-        receive_response(entries, fun.({:headers, value}, acc), fun, mint, ref, timeout)
+        with true <- is_integer(max_body),
+             {_header_name, content_length_str} <- List.keyfind(value, "content-length", 0),
+             {content_length, ""} = Integer.parse(content_length_str),
+             true <- content_length > max_body do
+          {:error, mint, :response_body_too_large}
+        else
+          _ ->
+            receive_response(
+              entries,
+              fun.({:headers, value}, acc),
+              fun,
+              mint,
+              ref,
+              timeout,
+              max_body,
+              body_sum
+            )
+        end
 
       {:data, ^ref, value} ->
-        receive_response(entries, fun.({:data, value}, acc), fun, mint, ref, timeout)
+        body_sum = :erlang.iolist_size(value) + body_sum
+
+        with true <- is_integer(max_body),
+             true <- body_sum > max_body do
+          {:error, mint, :response_body_too_large}
+        else
+          _ ->
+            receive_response(
+              entries,
+              fun.({:data, value}, acc),
+              fun,
+              mint,
+              ref,
+              timeout,
+              max_body,
+              body_sum
+            )
+        end
 
       {:done, ^ref} ->
         {:ok, mint, acc}

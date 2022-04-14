@@ -261,6 +261,33 @@ defmodule FinchTest do
       assert {"content-type", "application/json"} in headers
     end
 
+    test "reports response too large HTTP/2", %{bypass: bypass} do
+      start_supervised!(
+        {Finch,
+         name: finch_name(),
+         pools: %{
+           default: [
+             protocol: :http2,
+             count: 1,
+             conn_opts: [
+               transport_opts: [
+                 verify: :verify_none
+               ]
+             ]
+           ]
+         }}
+      )
+
+      Bypass.expect(bypass, "GET", "/", fn conn ->
+        Plug.Conn.send_resp(conn, 200, :binary.copy(" ", 1_000))
+      end)
+
+      request = Finch.build(:get, endpoint(bypass))
+
+      assert {:error, %Finch.Error{reason: :response_body_too_large}} =
+               Finch.request(request, finch_name(), max_response_body: 999)
+    end
+
     test "successful post HTTP/2 streaming request, with streaming body and query string", %{
       bypass: bypass
     } do
@@ -867,6 +894,17 @@ defmodule FinchTest do
       assert {:ok, %{status: 201}} = Finch.request(request, client)
 
       assert_receive {:telemetry_event, [:finch, :recv, :stop], %{status: 201}}
+    end
+
+    test "reports response too large", %{bypass: bypass, client: client} do
+      Bypass.expect(bypass, "GET", "/", fn conn ->
+        Plug.Conn.send_resp(conn, 200, :binary.copy(" ", 1_000))
+      end)
+
+      request = Finch.build(:get, endpoint(bypass))
+
+      assert {:error, %Finch.Error{reason: :response_body_too_large}} =
+               Finch.request(request, client, max_response_body: 999)
     end
 
     test "reports reused connections", %{bypass: bypass, client: client} do
